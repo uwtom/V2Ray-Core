@@ -25,7 +25,7 @@ type packer interface {
 }
 
 type packedPacket struct {
-	header          *wire.Header
+	header          *wire.ExtendedHeader
 	raw             []byte
 	frames          []wire.Frame
 	encryptionLevel protocol.EncryptionLevel
@@ -397,21 +397,20 @@ func (p *packetPacker) composeNextPacket(
 	return frames, nil
 }
 
-func (p *packetPacker) getHeader(encLevel protocol.EncryptionLevel) *wire.Header {
+func (p *packetPacker) getHeader(encLevel protocol.EncryptionLevel) *wire.ExtendedHeader {
 	pn, pnLen := p.pnManager.PeekPacketNumber()
-	header := &wire.Header{
-		PacketNumber:     pn,
-		PacketNumberLen:  pnLen,
-		Version:          p.version,
-		DestConnectionID: p.destConnID,
-	}
+	header := &wire.ExtendedHeader{}
+	header.PacketNumber = pn
+	header.PacketNumberLen = pnLen
+	header.Version = p.version
+	header.DestConnectionID = p.destConnID
 
 	if encLevel != protocol.Encryption1RTT {
 		header.IsLongHeader = true
 		header.SrcConnectionID = p.srcConnID
-		// Set the payload len to maximum size.
+		// Set the length to the maximum packet size.
 		// Since it is encoded as a varint, this guarantees us that the header will end up at most as big as GetLength() returns.
-		header.PayloadLen = p.maxPacketSize
+		header.Length = p.maxPacketSize
 		switch encLevel {
 		case protocol.EncryptionInitial:
 			header.Type = protocol.PacketTypeInitial
@@ -424,8 +423,7 @@ func (p *packetPacker) getHeader(encLevel protocol.EncryptionLevel) *wire.Header
 }
 
 func (p *packetPacker) writeAndSealPacket(
-	header *wire.Header,
-	frames []wire.Frame,
+	header *wire.ExtendedHeader, frames []wire.Frame,
 	sealer handshake.Sealer,
 ) ([]byte, error) {
 	raw := *getPacketBuffer()
@@ -433,24 +431,24 @@ func (p *packetPacker) writeAndSealPacket(
 
 	addPadding := p.perspective == protocol.PerspectiveClient && header.Type == protocol.PacketTypeInitial && !p.hasSentPacket
 
-	// the payload length is only needed for Long Headers
+	// the length is only needed for Long Headers
 	if header.IsLongHeader {
 		if p.perspective == protocol.PerspectiveClient && header.Type == protocol.PacketTypeInitial {
 			header.Token = p.token
 		}
 		if addPadding {
 			headerLen := header.GetLength(p.version)
-			header.PayloadLen = protocol.ByteCount(protocol.MinInitialPacketSize) - headerLen
+			header.Length = protocol.ByteCount(header.PacketNumberLen) + protocol.MinInitialPacketSize - headerLen
 		} else {
-			payloadLen := protocol.ByteCount(sealer.Overhead())
+			length := protocol.ByteCount(sealer.Overhead()) + protocol.ByteCount(header.PacketNumberLen)
 			for _, frame := range frames {
-				payloadLen += frame.Length(p.version)
+				length += frame.Length(p.version)
 			}
-			header.PayloadLen = payloadLen
+			header.Length = length
 		}
 	}
 
-	if err := header.Write(buffer, p.perspective, p.version); err != nil {
+	if err := header.Write(buffer, p.version); err != nil {
 		return nil, err
 	}
 	payloadStartIndex := buffer.Len()

@@ -6,9 +6,9 @@ import (
 	"time"
 
 	quic "github.com/lucas-clemente/quic-go"
-
 	"v2ray.com/core/common"
 	"v2ray.com/core/common/net"
+	"v2ray.com/core/common/task"
 	"v2ray.com/core/transport/internet"
 	"v2ray.com/core/transport/internet/tls"
 )
@@ -18,9 +18,31 @@ type sessionContext struct {
 	session quic.Session
 }
 
+var errSessionClosed = newError("session closed")
+
+func (c *sessionContext) openStream(destAddr net.Addr) (*interConn, error) {
+	if !isActive(c.session) {
+		return nil, errSessionClosed
+	}
+
+	stream, err := c.session.OpenStream()
+	if err != nil {
+		return nil, err
+	}
+
+	conn := &interConn{
+		stream: stream,
+		local:  c.session.LocalAddr(),
+		remote: destAddr,
+	}
+
+	return conn, nil
+}
+
 type clientSessions struct {
 	access   sync.Mutex
 	sessions map[net.Destination][]*sessionContext
+	cleanup  *task.Periodic
 }
 
 func isActive(s quic.Session) bool {
@@ -37,8 +59,13 @@ func removeInactiveSessions(sessions []*sessionContext) []*sessionContext {
 	for _, s := range sessions {
 		if isActive(s.session) {
 			activeSessions = append(activeSessions, s)
-		} else {
-			s.rawConn.Close()
+			continue
+		}
+		if err := s.session.Close(); err != nil {
+			newError("failed to close session").Base(err).WriteToLog()
+		}
+		if err := s.rawConn.Close(); err != nil {
+			newError("failed to close raw connection").Base(err).WriteToLog()
 		}
 	}
 
@@ -49,21 +76,42 @@ func removeInactiveSessions(sessions []*sessionContext) []*sessionContext {
 	return sessions
 }
 
-func openStream(sessions []*sessionContext) (quic.Stream, net.Addr) {
+func openStream(sessions []*sessionContext, destAddr net.Addr) *interConn {
 	for _, s := range sessions {
 		if !isActive(s.session) {
 			continue
 		}
 
-		stream, err := s.session.OpenStream()
+		conn, err := s.openStream(destAddr)
 		if err != nil {
-			newError("failed to create stream").Base(err).AtWarning().WriteToLog()
 			continue
 		}
-		return stream, s.session.LocalAddr()
+
+		return conn
 	}
 
-	return nil, nil
+	return nil
+}
+
+func (s *clientSessions) cleanSessions() error {
+	s.access.Lock()
+	defer s.access.Unlock()
+
+	if len(s.sessions) == 0 {
+		return nil
+	}
+
+	newSessionMap := make(map[net.Destination][]*sessionContext)
+
+	for dest, sessions := range s.sessions {
+		sessions = removeInactiveSessions(sessions)
+		if len(sessions) > 0 {
+			newSessionMap[dest] = sessions
+		}
+	}
+
+	s.sessions = newSessionMap
+	return nil
 }
 
 func (s *clientSessions) openConnection(destAddr net.Addr, config *Config, tlsConfig *tls.Config, sockopt *internet.SocketConfig) (internet.Connection, error) {
@@ -81,14 +129,10 @@ func (s *clientSessions) openConnection(destAddr net.Addr, config *Config, tlsCo
 		sessions = s
 	}
 
-	{
-		stream, local := openStream(sessions)
-		if stream != nil {
-			return &interConn{
-				stream: stream,
-				local:  local,
-				remote: destAddr,
-			}, nil
+	if true {
+		conn := openStream(sessions, destAddr)
+		if conn != nil {
+			return conn, nil
 		}
 	}
 
@@ -103,13 +147,13 @@ func (s *clientSessions) openConnection(destAddr net.Addr, config *Config, tlsCo
 	}
 
 	quicConfig := &quic.Config{
-		ConnectionIDLength:                    8,
+		ConnectionIDLength:                    12,
 		HandshakeTimeout:                      time.Second * 8,
-		IdleTimeout:                           time.Second * 30,
-		MaxReceiveStreamFlowControlWindow:     128 * 1024,
-		MaxReceiveConnectionFlowControlWindow: 2 * 1024 * 1024,
+		IdleTimeout:                           time.Second * 120,
 		MaxIncomingUniStreams:                 -1,
-		MaxIncomingStreams:                    32,
+		MaxIncomingStreams:                    -1,
+		MaxReceiveStreamFlowControlWindow:     256 * 1024,
+		MaxReceiveConnectionFlowControlWindow: 2 * 1024 * 1024,
 	}
 
 	conn, err := wrapSysConn(rawConn, config)
@@ -124,22 +168,24 @@ func (s *clientSessions) openConnection(destAddr net.Addr, config *Config, tlsCo
 		return nil, err
 	}
 
-	s.sessions[dest] = append(sessions, &sessionContext{
+	context := &sessionContext{
 		session: session,
 		rawConn: conn,
-	})
-	stream, err := session.OpenStream()
-	if err != nil {
-		return nil, err
 	}
-	return &interConn{
-		stream: stream,
-		local:  session.LocalAddr(),
-		remote: destAddr,
-	}, nil
+	s.sessions[dest] = append(sessions, context)
+	return context.openStream(destAddr)
 }
 
 var client clientSessions
+
+func init() {
+	client.sessions = make(map[net.Destination][]*sessionContext)
+	client.cleanup = &task.Periodic{
+		Interval: time.Minute,
+		Execute:  client.cleanSessions,
+	}
+	common.Must(client.cleanup.Start())
+}
 
 func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.MemoryStreamConfig) (internet.Connection, error) {
 	tlsConfig := tls.ConfigFromStreamSettings(streamSettings)
@@ -150,9 +196,18 @@ func Dial(ctx context.Context, dest net.Destination, streamSettings *internet.Me
 		}
 	}
 
-	destAddr, err := net.ResolveUDPAddr("udp", dest.NetAddr())
-	if err != nil {
-		return nil, err
+	var destAddr *net.UDPAddr
+	if dest.Address.Family().IsIP() {
+		destAddr = &net.UDPAddr{
+			IP:   dest.Address.IP(),
+			Port: int(dest.Port),
+		}
+	} else {
+		addr, err := net.ResolveUDPAddr("udp", dest.NetAddr())
+		if err != nil {
+			return nil, err
+		}
+		destAddr = addr
 	}
 
 	config := streamSettings.ProtocolSettings.(*Config)

@@ -162,9 +162,12 @@ func (c *interConn) WriteMultiBuffer(mb buf.MultiBuffer) error {
 	defer reader.Close()
 
 	for {
-		nBytes, err := reader.Read(b[:1380])
+		nBytes, err := reader.Read(b[:1200])
 		if err != nil {
 			break
+		}
+		if nBytes == 0 {
+			continue
 		}
 		if _, err := c.Write(b[:nBytes]); err != nil {
 			return err
@@ -179,6 +182,7 @@ func (c *interConn) Write(b []byte) (int, error) {
 }
 
 func (c *interConn) Close() error {
+	c.stream.CancelRead(0x00)
 	return c.stream.Close()
 }
 
