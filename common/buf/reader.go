@@ -7,7 +7,7 @@ import (
 	"v2ray.com/core/common/errors"
 )
 
-func readOne(r io.Reader) (*Buffer, error) {
+func readOneUDP(r io.Reader) (*Buffer, error) {
 	b := New()
 	for i := 0; i < 64; i++ {
 		_, err := b.ReadFrom(r)
@@ -20,6 +20,34 @@ func readOne(r io.Reader) (*Buffer, error) {
 		}
 	}
 
+	b.Release()
+	return nil, newError("Reader returns too many empty payloads.")
+}
+
+func readOne(r io.Reader) (*Buffer, error) {
+	// Use an one-byte buffer to wait for incoming payload.
+	var firstByte [1]byte
+	nBytes, err := r.Read(firstByte[:])
+	if err != nil {
+		return nil, err
+	}
+
+	b := New()
+	if nBytes > 0 {
+		common.Must(b.WriteByte(firstByte[0]))
+	}
+	for i := 0; i < 64; i++ {
+		_, err := b.ReadFrom(r)
+		if !b.IsEmpty() {
+			return b, nil
+		}
+		if err != nil {
+			b.Release()
+			return nil, err
+		}
+	}
+
+	b.Release()
 	return nil, newError("Reader returns too many empty payloads.")
 }
 
@@ -136,6 +164,20 @@ type SingleReader struct {
 // ReadMultiBuffer implements Reader.
 func (r *SingleReader) ReadMultiBuffer() (MultiBuffer, error) {
 	b, err := readOne(r.Reader)
+	if err != nil {
+		return nil, err
+	}
+	return MultiBuffer{b}, nil
+}
+
+// PacketReader is a Reader that read one Buffer every time.
+type PacketReader struct {
+	io.Reader
+}
+
+// ReadMultiBuffer implements Reader.
+func (r *PacketReader) ReadMultiBuffer() (MultiBuffer, error) {
+	b, err := readOneUDP(r.Reader)
 	if err != nil {
 		return nil, err
 	}
