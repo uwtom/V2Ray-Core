@@ -77,13 +77,13 @@ func (r *cachedReader) ReadMultiBufferTimeout(timeout time.Duration) (buf.MultiB
 	return r.reader.ReadMultiBufferTimeout(timeout)
 }
 
-func (r *cachedReader) CloseError() {
+func (r *cachedReader) Interrupt() {
 	r.Lock()
 	if r.cache != nil {
 		r.cache = buf.ReleaseMulti(r.cache)
 	}
 	r.Unlock()
-	r.reader.CloseError()
+	r.reader.Interrupt()
 }
 
 // DefaultDispatcher is a default implementation of Dispatcher.
@@ -263,5 +263,13 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 			newError("default route for ", destination).WriteToLog(session.ExportIDToError(ctx))
 		}
 	}
+
+	if dispatcher == nil {
+		newError("default outbound handler not exist").WriteToLog(session.ExportIDToError(ctx))
+		common.Close(link.Writer)
+		common.Interrupt(link.Reader)
+		return
+	}
+
 	dispatcher.Dispatch(ctx, link)
 }
