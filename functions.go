@@ -7,6 +7,7 @@ import (
 	"v2ray.com/core/common"
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/features/routing"
+	"v2ray.com/core/transport/internet/udp"
 )
 
 // CreateObject creates a new object based on the given V2Ray instance and config. The V2Ray instance may be nil.
@@ -52,5 +53,25 @@ func Dial(ctx context.Context, v *Instance, dest net.Destination) (net.Conn, err
 	if err != nil {
 		return nil, err
 	}
-	return net.NewConnection(net.ConnectionInputMulti(r.Writer), net.ConnectionOutputMulti(r.Reader)), nil
+	var readerOpt net.ConnectionOption
+	if dest.Network == net.Network_TCP {
+		readerOpt = net.ConnectionOutputMulti(r.Reader)
+	} else {
+		readerOpt = net.ConnectionOutputMultiUDP(r.Reader)
+	}
+	return net.NewConnection(net.ConnectionInputMulti(r.Writer), readerOpt), nil
+}
+
+// DialUDP provides a way to exchange UDP packets through V2Ray instance to remote servers.
+// Since it is under a proxy context, the LocalAddr() in returned PacketConn will not show the real address.
+//
+// TODO: SetDeadline() / SetReadDeadline() / SetWriteDeadline() are not implemented.
+//
+// v2ray:api:beta
+func DialUDP(ctx context.Context, v *Instance) (net.PacketConn, error) {
+	dispatcher := v.GetFeature(routing.DispatcherType())
+	if dispatcher == nil {
+		return nil, newError("routing.Dispatcher is not registered in V2Ray core")
+	}
+	return udp.DialDispatcher(ctx, dispatcher.(routing.Dispatcher))
 }
