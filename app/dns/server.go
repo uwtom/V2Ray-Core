@@ -226,6 +226,9 @@ func (s *Server) lookupIPInternal(domain string, option IPOption) ([]net.IP, err
 			if len(ips) > 0 {
 				return ips, nil
 			}
+			if err == dns.ErrEmptyResponse {
+				return nil, err
+			}
 			if err != nil {
 				newError("failed to lookup ip for domain ", domain, " at server ", ns.Name()).Base(err).WriteToLog()
 				lastErr = err
@@ -241,6 +244,9 @@ func (s *Server) lookupIPInternal(domain string, option IPOption) ([]net.IP, err
 		if err != nil {
 			newError("failed to lookup ip for domain ", domain, " at server ", client.Name()).Base(err).WriteToLog()
 			lastErr = err
+		}
+		if err != context.Canceled && err != context.DeadlineExceeded {
+			return nil, err
 		}
 	}
 

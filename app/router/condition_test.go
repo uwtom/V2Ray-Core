@@ -9,7 +9,6 @@ import (
 
 	proto "github.com/golang/protobuf/proto"
 
-	"v2ray.com/core/app/dispatcher"
 	. "v2ray.com/core/app/router"
 	"v2ray.com/core/common"
 	"v2ray.com/core/common/errors"
@@ -218,7 +217,7 @@ func TestRoutingRule(t *testing.T) {
 			},
 			test: []ruleTest{
 				{
-					input:  dispatcher.ContextWithSniffingResult(context.Background(), &http.SniffHeader{}),
+					input:  session.ContextWithContent(context.Background(), &session.Content{Protocol: (&http.SniffHeader{}).Protocol()}),
 					output: true,
 				},
 			},
@@ -234,6 +233,34 @@ func TestRoutingRule(t *testing.T) {
 				},
 				{
 					input:  withInbound(&session.Inbound{Tag: "test2"}),
+					output: false,
+				},
+			},
+		},
+		{
+			rule: &RoutingRule{
+				PortList: &net.PortList{
+					Range: []*net.PortRange{
+						{From: 443, To: 443},
+						{From: 1000, To: 1100},
+					},
+				},
+			},
+			test: []ruleTest{
+				{
+					input:  withOutbound(&session.Outbound{Target: net.TCPDestination(net.LocalHostIP, 443)}),
+					output: true,
+				},
+				{
+					input:  withOutbound(&session.Outbound{Target: net.TCPDestination(net.LocalHostIP, 1100)}),
+					output: true,
+				},
+				{
+					input:  withOutbound(&session.Outbound{Target: net.TCPDestination(net.LocalHostIP, 1005)}),
+					output: true,
+				},
+				{
+					input:  withOutbound(&session.Outbound{Target: net.TCPDestination(net.LocalHostIP, 53)}),
 					output: false,
 				},
 			},
