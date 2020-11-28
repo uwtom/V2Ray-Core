@@ -2,6 +2,8 @@ package conf
 
 import (
 	"encoding/json"
+	"log"
+	"os"
 	"strings"
 
 	"v2ray.com/core"
@@ -9,6 +11,7 @@ import (
 	"v2ray.com/core/app/proxyman"
 	"v2ray.com/core/app/stats"
 	"v2ray.com/core/common/serial"
+	"v2ray.com/core/transport/internet/xtls"
 )
 
 var (
@@ -17,7 +20,9 @@ var (
 		"http":          func() interface{} { return new(HttpServerConfig) },
 		"shadowsocks":   func() interface{} { return new(ShadowsocksServerConfig) },
 		"socks":         func() interface{} { return new(SocksServerConfig) },
+		"vless":         func() interface{} { return new(VLessInboundConfig) },
 		"vmess":         func() interface{} { return new(VMessInboundConfig) },
+		"trojan":        func() interface{} { return new(TrojanServerConfig) },
 		"mtproto":       func() interface{} { return new(MTProtoServerConfig) },
 	}, "protocol", "settings")
 
@@ -26,11 +31,15 @@ var (
 		"freedom":     func() interface{} { return new(FreedomConfig) },
 		"http":        func() interface{} { return new(HttpClientConfig) },
 		"shadowsocks": func() interface{} { return new(ShadowsocksClientConfig) },
-		"vmess":       func() interface{} { return new(VMessOutboundConfig) },
 		"socks":       func() interface{} { return new(SocksClientConfig) },
+		"vless":       func() interface{} { return new(VLessOutboundConfig) },
+		"vmess":       func() interface{} { return new(VMessOutboundConfig) },
+		"trojan":      func() interface{} { return new(TrojanClientConfig) },
 		"mtproto":     func() interface{} { return new(MTProtoClientConfig) },
 		"dns":         func() interface{} { return new(DnsOutboundConfig) },
 	}, "protocol", "settings")
+
+	ctllog = log.New(os.Stderr, "v2ctl> ", 0)
 )
 
 func toProtocolList(s []string) ([]proxyman.KnownProtocols, error) {
@@ -53,6 +62,7 @@ type SniffingConfig struct {
 	DestOverride *StringList `json:"destOverride"`
 }
 
+// Build implements Buildable.
 func (c *SniffingConfig) Build() (*proxyman.SniffingConfig, error) {
 	var p []string
 	if c.DestOverride != nil {
@@ -178,6 +188,9 @@ func (c *InboundDetourConfig) Build() (*core.InboundHandlerConfig, error) {
 		if err != nil {
 			return nil, err
 		}
+		if ss.SecurityType == serial.GetMessageType(&xtls.Config{}) && !strings.EqualFold(c.Protocol, "vless") {
+			return nil, newError("XTLS only supports VLESS for now.")
+		}
 		receiverSettings.StreamSettings = ss
 	}
 	if c.SniffingConfig != nil {
@@ -245,6 +258,9 @@ func (c *OutboundDetourConfig) Build() (*core.OutboundHandlerConfig, error) {
 		if err != nil {
 			return nil, err
 		}
+		if ss.SecurityType == serial.GetMessageType(&xtls.Config{}) && !strings.EqualFold(c.Protocol, "vless") {
+			return nil, newError("XTLS only supports VLESS for now.")
+		}
 		senderSettings.StreamSettings = ss
 	}
 
@@ -257,7 +273,15 @@ func (c *OutboundDetourConfig) Build() (*core.OutboundHandlerConfig, error) {
 	}
 
 	if c.MuxSettings != nil {
-		senderSettings.MultiplexSettings = c.MuxSettings.Build()
+		ms := c.MuxSettings.Build()
+		if ms != nil && ms.Enabled {
+			if ss := senderSettings.StreamSettings; ss != nil {
+				if ss.SecurityType == serial.GetMessageType(&xtls.Config{}) {
+					return nil, newError("XTLS doesn't support Mux for now.")
+				}
+			}
+		}
+		senderSettings.MultiplexSettings = ms
 	}
 
 	settings := []byte("{}")
@@ -282,6 +306,7 @@ func (c *OutboundDetourConfig) Build() (*core.OutboundHandlerConfig, error) {
 
 type StatsConfig struct{}
 
+// Build implements Buildable.
 func (c *StatsConfig) Build() (*stats.Config, error) {
 	return &stats.Config{}, nil
 }
@@ -302,6 +327,109 @@ type Config struct {
 	Api             *ApiConfig             `json:"api"`
 	Stats           *StatsConfig           `json:"stats"`
 	Reverse         *ReverseConfig         `json:"reverse"`
+}
+
+func (c *Config) findInboundTag(tag string) int {
+	found := -1
+	for idx, ib := range c.InboundConfigs {
+		if ib.Tag == tag {
+			found = idx
+			break
+		}
+	}
+	return found
+}
+
+func (c *Config) findOutboundTag(tag string) int {
+	found := -1
+	for idx, ob := range c.OutboundConfigs {
+		if ob.Tag == tag {
+			found = idx
+			break
+		}
+	}
+	return found
+}
+
+// Override method accepts another Config overrides the current attribute
+func (c *Config) Override(o *Config, fn string) {
+
+	// only process the non-deprecated members
+
+	if o.LogConfig != nil {
+		c.LogConfig = o.LogConfig
+	}
+	if o.RouterConfig != nil {
+		c.RouterConfig = o.RouterConfig
+	}
+	if o.DNSConfig != nil {
+		c.DNSConfig = o.DNSConfig
+	}
+	if o.Transport != nil {
+		c.Transport = o.Transport
+	}
+	if o.Policy != nil {
+		c.Policy = o.Policy
+	}
+	if o.Api != nil {
+		c.Api = o.Api
+	}
+	if o.Stats != nil {
+		c.Stats = o.Stats
+	}
+	if o.Reverse != nil {
+		c.Reverse = o.Reverse
+	}
+
+	// deprecated attrs... keep them for now
+	if o.InboundConfig != nil {
+		c.InboundConfig = o.InboundConfig
+	}
+	if o.OutboundConfig != nil {
+		c.OutboundConfig = o.OutboundConfig
+	}
+	if o.InboundDetours != nil {
+		c.InboundDetours = o.InboundDetours
+	}
+	if o.OutboundDetours != nil {
+		c.OutboundDetours = o.OutboundDetours
+	}
+	// deprecated attrs
+
+	// update the Inbound in slice if the only one in overide config has same tag
+	if len(o.InboundConfigs) > 0 {
+		if len(c.InboundConfigs) > 0 && len(o.InboundConfigs) == 1 {
+			if idx := c.findInboundTag(o.InboundConfigs[0].Tag); idx > -1 {
+				c.InboundConfigs[idx] = o.InboundConfigs[0]
+				ctllog.Println("[", fn, "] updated inbound with tag: ", o.InboundConfigs[0].Tag)
+			} else {
+				c.InboundConfigs = append(c.InboundConfigs, o.InboundConfigs[0])
+				ctllog.Println("[", fn, "] appended inbound with tag: ", o.InboundConfigs[0].Tag)
+			}
+		} else {
+			c.InboundConfigs = o.InboundConfigs
+		}
+	}
+
+	// update the Outbound in slice if the only one in overide config has same tag
+	if len(o.OutboundConfigs) > 0 {
+		if len(c.OutboundConfigs) > 0 && len(o.OutboundConfigs) == 1 {
+			if idx := c.findOutboundTag(o.OutboundConfigs[0].Tag); idx > -1 {
+				c.OutboundConfigs[idx] = o.OutboundConfigs[0]
+				ctllog.Println("[", fn, "] updated outbound with tag: ", o.OutboundConfigs[0].Tag)
+			} else {
+				if strings.Contains(strings.ToLower(fn), "tail") {
+					c.OutboundConfigs = append(c.OutboundConfigs, o.OutboundConfigs[0])
+					ctllog.Println("[", fn, "] appended outbound with tag: ", o.OutboundConfigs[0].Tag)
+				} else {
+					c.OutboundConfigs = append(o.OutboundConfigs, c.OutboundConfigs...)
+					ctllog.Println("[", fn, "] prepended outbound with tag: ", o.OutboundConfigs[0].Tag)
+				}
+			}
+		} else {
+			c.OutboundConfigs = o.OutboundConfigs
+		}
+	}
 }
 
 func applyTransportConfig(s *StreamConfig, t *TransportConfig) {

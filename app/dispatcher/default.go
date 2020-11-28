@@ -2,7 +2,7 @@
 
 package dispatcher
 
-//go:generate errorgen
+//go:generate go run v2ray.com/core/common/errors/errorgen
 
 import (
 	"context"
@@ -20,6 +20,7 @@ import (
 	"v2ray.com/core/features/outbound"
 	"v2ray.com/core/features/policy"
 	"v2ray.com/core/features/routing"
+	routing_session "v2ray.com/core/features/routing/session"
 	"v2ray.com/core/features/stats"
 	"v2ray.com/core/transport"
 	"v2ray.com/core/transport/pipe"
@@ -258,8 +259,15 @@ func sniffer(ctx context.Context, cReader *cachedReader) (SniffResult, error) {
 
 func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.Link, destination net.Destination) {
 	var handler outbound.Handler
-	if d.router != nil {
-		if tag, err := d.router.PickRoute(ctx); err == nil {
+
+	skipRoutePick := false
+	if content := session.ContentFromContext(ctx); content != nil {
+		skipRoutePick = content.SkipRoutePick
+	}
+
+	if d.router != nil && !skipRoutePick {
+		if route, err := d.router.PickRoute(routing_session.AsRoutingContext(ctx)); err == nil {
+			tag := route.GetOutboundTag()
 			if h := d.ohm.GetHandler(tag); h != nil {
 				newError("taking detour [", tag, "] for [", destination, "]").WriteToLog(session.ExportIDToError(ctx))
 				handler = h
@@ -282,12 +290,9 @@ func (d *DefaultDispatcher) routedDispatch(ctx context.Context, link *transport.
 		return
 	}
 
-	accessMessage := log.AccessMessageFromContext(ctx)
-	if accessMessage != nil {
-		if len(handler.Tag()) > 0 {
-			accessMessage.Detour = handler.Tag()
-		} else {
-			accessMessage.Detour = ""
+	if accessMessage := log.AccessMessageFromContext(ctx); accessMessage != nil {
+		if tag := handler.Tag(); tag != "" {
+			accessMessage.Detour = tag
 		}
 		log.Record(accessMessage)
 	}
